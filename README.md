@@ -22,6 +22,10 @@ Los docentes pueden crear grupos por nivel, materia y tipo de clase, compartir u
 
 Los estudiantes pueden unirse con el código de su docente. Para universidad la matrícula es obligatoria y se usa para enlazar los grupos. La lista de materias ofrece opciones comunes para Primaria, Secundaria, Preparatoria, Universidad y Posgrado; el docente también puede escribir otra materia.
 
+## Tareas y entregas
+
+Cada docente puede publicar tareas para los grupos que administra, con instrucciones y fecha límite. Los alumnos inscritos pueden entregar o actualizar una respuesta escrita; las entregas tardías se identifican. El docente revisa las respuestas, asigna una calificación de 0 a 100 y deja comentarios. Solo el docente del grupo y el estudiante inscrito pueden consultar la información correspondiente. Las tablas de tareas y entregas se crean automáticamente en Neon o SQLite y se incluyen en la migración de la base local.
+
 ## Ejecutar localmente
 
 Requiere Node.js 20 o posterior. En esta carpeta ejecuta `npm install`, copia `.env.example` a `.env`, agrega una clave de OpenAI válida en `OPENAI_API_KEY` y arranca con `npm start`; abre `http://localhost:3000`. Deja `DATABASE_URL` vacío para usar SQLite local.

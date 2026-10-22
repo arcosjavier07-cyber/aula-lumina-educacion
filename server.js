@@ -44,6 +44,20 @@ async function initializeDatabase() {
    student_id BIGINT REFERENCES users(id) ON DELETE SET NULL, matricula TEXT NOT NULL,
    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(class_id, matricula)
   )`);
+  await pgPool.query(`CREATE TABLE IF NOT EXISTS assignments (
+   id BIGSERIAL PRIMARY KEY, class_id BIGINT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+   title TEXT NOT NULL, instructions TEXT NOT NULL, due_at TIMESTAMPTZ NOT NULL,
+   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await pgPool.query(`CREATE TABLE IF NOT EXISTS assignment_submissions (
+   id BIGSERIAL PRIMARY KEY, assignment_id BIGINT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+   student_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   body TEXT NOT NULL, submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+   grade INTEGER CHECK (grade BETWEEN 0 AND 100), feedback TEXT NOT NULL DEFAULT '',
+   graded_at TIMESTAMPTZ, UNIQUE(assignment_id, student_id)
+  )`);
+  await pgPool.query('CREATE INDEX IF NOT EXISTS assignments_class_due_idx ON assignments(class_id,due_at)');
+  await pgPool.query('CREATE INDEX IF NOT EXISTS assignment_submissions_student_idx ON assignment_submissions(student_id)');
   await pgPool.query(`CREATE TABLE IF NOT EXISTS sessions (
    token_hash TEXT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
    expires_at TIMESTAMPTZ NOT NULL
@@ -74,11 +88,25 @@ async function initializeDatabase() {
    student_id INTEGER REFERENCES users(id) ON DELETE SET NULL, matricula TEXT NOT NULL,
    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(class_id, matricula)
   );
+  CREATE TABLE IF NOT EXISTS assignments (
+   id INTEGER PRIMARY KEY, class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+   title TEXT NOT NULL, instructions TEXT NOT NULL, due_at TEXT NOT NULL,
+   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS assignment_submissions (
+   id INTEGER PRIMARY KEY, assignment_id INTEGER NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+   student_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   body TEXT NOT NULL, submitted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+   grade INTEGER CHECK (grade BETWEEN 0 AND 100), feedback TEXT NOT NULL DEFAULT '',
+   graded_at TEXT, UNIQUE(assignment_id, student_id)
+  );
   CREATE TABLE IF NOT EXISTS sessions (
    token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
    expires_at TEXT NOT NULL
   );
-  CREATE INDEX IF NOT EXISTS class_roster_student_idx ON class_roster(student_id);`);
+  CREATE INDEX IF NOT EXISTS class_roster_student_idx ON class_roster(student_id);
+  CREATE INDEX IF NOT EXISTS assignments_class_due_idx ON assignments(class_id,due_at);
+  CREATE INDEX IF NOT EXISTS assignment_submissions_student_idx ON assignment_submissions(student_id);`);
   const oldStudents = db.prepare("SELECT id,details FROM users WHERE profile='alumno'").all();
   const addStudentProfile = db.prepare('INSERT OR IGNORE INTO student_profiles (user_id,matricula) VALUES (?,?)');
   for (const user of oldStudents) {
@@ -347,6 +375,78 @@ async function joinClass(user, code) {
  else db.prepare('INSERT INTO class_roster (class_id,student_id,matricula) VALUES (?,?,?)').run(classId,user.id,matricula);
  return {status:200,ok:true};
 }
+async function createAssignmentRecord(teacherId,classId,data) {
+ const owned=postgres
+  ? (await pgPool.query('SELECT id FROM classes WHERE id=$1 AND teacher_id=$2',[classId,teacherId])).rows[0]
+  : db.prepare('SELECT id FROM classes WHERE id=? AND teacher_id=?').get(classId,teacherId);
+ if (!owned) return null;
+ return postgres
+  ? (await pgPool.query('INSERT INTO assignments (class_id,title,instructions,due_at) VALUES ($1,$2,$3,$4) RETURNING *',[classId,data.title,data.instructions,data.dueAt])).rows[0]
+  : (()=>{const info=db.prepare('INSERT INTO assignments (class_id,title,instructions,due_at) VALUES (?,?,?,?)').run(classId,data.title,data.instructions,data.dueAt);return db.prepare('SELECT * FROM assignments WHERE id=?').get(Number(info.lastInsertRowid))})();
+}
+async function listAssignments(user) {
+ if (user.profile==='profesor') {
+  const assignments=postgres
+   ? (await pgPool.query('SELECT a.*,c.name AS class_name,c.subject,c.academic_level FROM assignments a JOIN classes c ON c.id=a.class_id WHERE c.teacher_id=$1 ORDER BY a.due_at,a.created_at DESC',[user.id])).rows
+   : db.prepare('SELECT a.*,c.name AS class_name,c.subject,c.academic_level FROM assignments a JOIN classes c ON c.id=a.class_id WHERE c.teacher_id=? ORDER BY a.due_at,a.created_at DESC').all(user.id);
+  const result=[];
+  for (const assignment of assignments) {
+   const rows=postgres
+    ? (await pgPool.query(`SELECT u.id AS student_id,sp.matricula,u.name AS student_name,u.details AS student_details,s.id AS submission_id,s.body,s.submitted_at,s.grade,s.feedback,s.graded_at
+       FROM users u LEFT JOIN student_profiles sp ON sp.user_id=u.id
+       LEFT JOIN assignment_submissions s ON s.assignment_id=$1 AND s.student_id=u.id
+       WHERE EXISTS (SELECT 1 FROM class_roster r WHERE r.class_id=$2 AND r.student_id=u.id) ORDER BY u.name`,[assignment.id,assignment.class_id])).rows
+    : db.prepare(`SELECT u.id AS student_id,sp.matricula,u.name AS student_name,u.details AS student_details,s.id AS submission_id,s.body,s.submitted_at,s.grade,s.feedback,s.graded_at
+       FROM users u LEFT JOIN student_profiles sp ON sp.user_id=u.id
+       LEFT JOIN assignment_submissions s ON s.assignment_id=? AND s.student_id=u.id
+       WHERE EXISTS (SELECT 1 FROM class_roster r WHERE r.class_id=? AND r.student_id=u.id) ORDER BY u.name`).all(assignment.id,assignment.class_id);
+   const submissions=rows.map(row=>{
+    const details=parseDetails(row.student_details),rawMatricula=String(details.studentId||row.matricula||'');
+    return {studentId:Number(row.student_id),name:row.student_name,matricula:rawMatricula.startsWith('CUENTA-')?'':rawMatricula,submitted:Boolean(row.submission_id),body:row.body||'',submittedAt:row.submitted_at||null,grade:row.grade==null?null:Number(row.grade),feedback:row.feedback||'',gradedAt:row.graded_at||null};
+   });
+   result.push({id:Number(assignment.id),classId:Number(assignment.class_id),className:assignment.class_name,subject:assignment.subject,academicLevel:assignment.academic_level,title:assignment.title,instructions:assignment.instructions,dueAt:assignment.due_at,createdAt:assignment.created_at,submittedCount:submissions.filter(item=>item.submitted).length,studentCount:submissions.length,submissions});
+  }
+  return result;
+ }
+ const assignments=postgres
+  ? (await pgPool.query(`SELECT a.*,c.name AS class_name,c.subject,c.academic_level,u.name AS teacher_name,s.body,s.submitted_at,s.grade,s.feedback,s.graded_at
+      FROM assignments a JOIN classes c ON c.id=a.class_id JOIN users u ON u.id=c.teacher_id
+      LEFT JOIN assignment_submissions s ON s.assignment_id=a.id AND s.student_id=$1
+      WHERE EXISTS (SELECT 1 FROM class_roster r WHERE r.class_id=a.class_id AND r.student_id=$1)
+      ORDER BY a.due_at,a.created_at DESC`,[user.id])).rows
+  : db.prepare(`SELECT a.*,c.name AS class_name,c.subject,c.academic_level,u.name AS teacher_name,s.body,s.submitted_at,s.grade,s.feedback,s.graded_at
+      FROM assignments a JOIN classes c ON c.id=a.class_id JOIN users u ON u.id=c.teacher_id
+      LEFT JOIN assignment_submissions s ON s.assignment_id=a.id AND s.student_id=?
+      WHERE EXISTS (SELECT 1 FROM class_roster r WHERE r.class_id=a.class_id AND r.student_id=?)
+      ORDER BY a.due_at,a.created_at DESC`).all(user.id,user.id);
+ return assignments.map(a=>({id:Number(a.id),classId:Number(a.class_id),className:a.class_name,subject:a.subject,academicLevel:a.academic_level,teacherName:a.teacher_name,title:a.title,instructions:a.instructions,dueAt:a.due_at,createdAt:a.created_at,body:a.body||'',submittedAt:a.submitted_at||null,grade:a.grade==null?null:Number(a.grade),feedback:a.feedback||'',gradedAt:a.graded_at||null}));
+}
+async function submitAssignment(userId,assignmentId,body) {
+ const assignment=postgres
+  ? (await pgPool.query('SELECT class_id FROM assignments WHERE id=$1',[assignmentId])).rows[0]
+  : db.prepare('SELECT class_id FROM assignments WHERE id=?').get(assignmentId);
+ if (!assignment) return {status:404,error:'No encontré esa tarea.'};
+ const enrolled=postgres
+  ? (await pgPool.query('SELECT 1 FROM class_roster WHERE class_id=$1 AND student_id=$2',[assignment.class_id,userId])).rows[0]
+  : db.prepare('SELECT 1 FROM class_roster WHERE class_id=? AND student_id=?').get(assignment.class_id,userId);
+ if (!enrolled) return {status:403,error:'Solo los alumnos inscritos en esa clase pueden entregar la tarea.'};
+ if (postgres) await pgPool.query(`INSERT INTO assignment_submissions (assignment_id,student_id,body,submitted_at,grade,feedback,graded_at)
+   VALUES ($1,$2,$3,NOW(),NULL,'',NULL) ON CONFLICT(assignment_id,student_id) DO UPDATE
+   SET body=EXCLUDED.body,submitted_at=NOW(),grade=NULL,feedback='',graded_at=NULL`,[assignmentId,userId,body]);
+ else db.prepare(`INSERT INTO assignment_submissions (assignment_id,student_id,body,submitted_at,grade,feedback,graded_at)
+   VALUES (?,?,?,CURRENT_TIMESTAMP,NULL,'',NULL) ON CONFLICT(assignment_id,student_id) DO UPDATE
+   SET body=excluded.body,submitted_at=CURRENT_TIMESTAMP,grade=NULL,feedback='',graded_at=NULL`).run(assignmentId,userId,body);
+ return {status:200,ok:true};
+}
+async function gradeAssignment(teacherId,assignmentId,studentId,grade,feedback) {
+ const updated=postgres
+  ? (await pgPool.query(`UPDATE assignment_submissions s SET grade=$1,feedback=$2,graded_at=NOW()
+      FROM assignments a JOIN classes c ON c.id=a.class_id
+      WHERE s.assignment_id=a.id AND a.id=$3 AND c.teacher_id=$4 AND s.student_id=$5
+      RETURNING s.assignment_id`,[grade,feedback,assignmentId,teacherId,studentId])).rows[0]
+  : (()=>{const owned=db.prepare('SELECT 1 FROM assignments a JOIN classes c ON c.id=a.class_id WHERE a.id=? AND c.teacher_id=?').get(assignmentId,teacherId);if(!owned)return null;return db.prepare('UPDATE assignment_submissions SET grade=?,feedback=?,graded_at=CURRENT_TIMESTAMP WHERE assignment_id=? AND student_id=?').run(grade,feedback,assignmentId,studentId).changes?{ok:true}:null})();
+ return updated||null;
+}
 app.get('/api/classes', auth, async (req,res) => res.json({classes:await listClassesForUser(req.user)}));
 app.post('/api/classes', auth, async (req,res) => {
  if (req.user.profile!=='profesor') return res.status(403).json({error:'Solo docentes pueden crear clases.'});
@@ -371,6 +471,28 @@ app.post('/api/classes/join', auth, async (req,res) => {
  const code=String(req.body?.code||'').trim().toUpperCase();
  if (!/^[A-F0-9]{7}$/.test(code)) return res.status(400).json({error:'Escribe el código de clase de 7 caracteres.'});
  const result=await joinClass(req.user,code);if(!result.ok)return res.status(result.status).json({error:result.error});res.json({ok:true,classes:await listClassesForUser(req.user)});
+});
+app.get('/api/assignments', auth, async (req,res) => res.json({assignments:await listAssignments(req.user)}));
+app.post('/api/classes/:id/assignments', auth, async (req,res) => {
+ if (req.user.profile!=='profesor') return res.status(403).json({error:'Solo docentes pueden publicar tareas.'});
+ const classId=Number(req.params.id),title=String(req.body?.title||'').trim().slice(0,120),instructions=String(req.body?.instructions||'').trim().slice(0,10000),due=new Date(req.body?.dueAt||'');
+ if(!Number.isSafeInteger(classId)||classId<1||!title||!instructions||!Number.isFinite(due.getTime()))return res.status(400).json({error:'Completa el título, las instrucciones y una fecha límite válida.'});
+ try{const assignment=await createAssignmentRecord(req.user.id,classId,{title,instructions,dueAt:due.toISOString()});if(!assignment)return res.status(404).json({error:'No encontré ese grupo en tu espacio.'});res.status(201).json({ok:true});}
+ catch(error){console.error('No se pudo publicar la tarea:',error.message);res.status(503).json({error:'No se pudo guardar la tarea. Inténtalo de nuevo.'});}
+});
+app.post('/api/assignments/:id/submission', auth, async (req,res) => {
+ if(req.user.profile!=='alumno')return res.status(403).json({error:'Solo estudiantes pueden entregar tareas.'});
+ const assignmentId=Number(req.params.id),body=typeof req.body?.body==='string'?req.body.body.trim():'';
+ if(!Number.isSafeInteger(assignmentId)||assignmentId<1||!body||body.length>10000)return res.status(400).json({error:'Escribe una respuesta de hasta 10,000 caracteres.'});
+ try{const result=await submitAssignment(req.user.id,assignmentId,body);if(!result.ok)return res.status(result.status).json({error:result.error});res.json({ok:true});}
+ catch(error){console.error('No se pudo guardar la entrega:',error.message);res.status(503).json({error:'No se pudo guardar la entrega. Inténtalo de nuevo.'});}
+});
+app.post('/api/assignments/:id/submissions/:studentId/grade', auth, async (req,res) => {
+ if(req.user.profile!=='profesor')return res.status(403).json({error:'Solo docentes pueden calificar tareas.'});
+ const assignmentId=Number(req.params.id),studentId=Number(req.params.studentId),grade=Number(req.body?.grade),feedback=String(req.body?.feedback||'').trim().slice(0,2000);
+ if(!Number.isSafeInteger(assignmentId)||assignmentId<1||!Number.isSafeInteger(studentId)||studentId<1||!Number.isInteger(grade)||grade<0||grade>100)return res.status(400).json({error:'La calificación debe ser un número entero de 0 a 100.'});
+ try{const result=await gradeAssignment(req.user.id,assignmentId,studentId,grade,feedback);if(!result)return res.status(404).json({error:'No encontré una entrega de ese alumno en tus clases.'});res.json({ok:true});}
+ catch(error){console.error('No se pudo guardar la calificación:',error.message);res.status(503).json({error:'No se pudo guardar la calificación. Inténtalo de nuevo.'});}
 });
 app.post('/api/chat', auth, async (req,res) => {
  const { messages = [], subject = '', level = '' } = req.body || {};
