@@ -25,6 +25,16 @@ db.exec(`CREATE TABLE IF NOT EXISTS users (
 const sessions = new Map();
 const mediaRequests = new Map();
 const mediaFeatureEnabled = () => process.env.OPENAI_MEDIA_ENABLED === 'true';
+function ageFromBirthDate(value) {
+ if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+ const [year, month, day] = value.split('-').map(Number);
+ const date = new Date(Date.UTC(year, month - 1, day));
+ if (date.getUTCFullYear() !== year || date.getUTCMonth() + 1 !== month || date.getUTCDate() !== day) return null;
+ const today = new Date();
+ let age = today.getUTCFullYear() - year;
+ if (today.getUTCMonth() + 1 < month || (today.getUTCMonth() + 1 === month && today.getUTCDate() < day)) age -= 1;
+ return age >= 5 && age <= 120 ? age : null;
+}
 function allowMediaRequest(req, res, kind, limit) {
  const key = `${req.user.id}:${kind}`;
  const now = Date.now();
@@ -60,12 +70,16 @@ function auth(req, res, next) {
  next();
 }
 app.post('/api/register', (req, res) => {
- const { name, email, password, profile, details = {} } = req.body || {};
- if (!name?.trim() || !/^\S+@\S+\.\S+$/.test(email || '') || (password || '').length < 8 || !['alumno','profesor'].includes(profile)) return res.status(400).json({ error: 'Completa tus datos y usa una contraseña de al menos 8 caracteres.' });
+ const { name, email, password, profile } = req.body || {};
+ const details = req.body?.details && typeof req.body.details === 'object' && !Array.isArray(req.body.details) ? req.body.details : {};
+ const age = ageFromBirthDate(details.birth);
+ const academicLevel = profile === 'alumno' ? details.level : details.teachLevels || details.level;
+ if (!name?.trim() || !/^\S+@\S+\.\S+$/.test(email || '') || (password || '').length < 8 || !['alumno','profesor'].includes(profile) || !age || !String(academicLevel || '').trim()) return res.status(400).json({ error: 'Completa los campos obligatorios, indica tu nivel académico y usa una fecha de nacimiento válida. La contraseña debe tener al menos 8 caracteres.' });
+ const savedDetails = { ...details, age, level: String(academicLevel).trim() };
  const salt = crypto.randomBytes(16).toString('hex');
  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
  try {
-  const info = db.prepare('INSERT INTO users (name,email,password_hash,salt,profile,details) VALUES (?,?,?,?,?,?)').run(name.trim(), email.toLowerCase().trim(), hash, salt, profile, JSON.stringify(details));
+  const info = db.prepare('INSERT INTO users (name,email,password_hash,salt,profile,details) VALUES (?,?,?,?,?,?)').run(name.trim(), email.toLowerCase().trim(), hash, salt, profile, JSON.stringify(savedDetails));
   const token = crypto.randomBytes(32).toString('hex'); sessions.set(token, Number(info.lastInsertRowid));
   res.json({ token, user: db.prepare('SELECT id,name,email,profile,details FROM users WHERE id=?').get(info.lastInsertRowid) });
  } catch { res.status(409).json({ error: 'Ya existe una cuenta con ese correo.' }); }
