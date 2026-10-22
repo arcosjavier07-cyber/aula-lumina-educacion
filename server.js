@@ -61,14 +61,29 @@ app.post('/api/profile', auth, (req,res) => {
 });
 app.post('/api/chat', auth, async (req,res) => {
  const { messages = [], subject = '', level = '' } = req.body || {};
- if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'El chat con Claude está listo, pero el administrador aún debe configurar ANTHROPIC_API_KEY en el hosting.' });
+ if (!process.env.OPENAI_API_KEY) return res.status(503).json({ error: 'El chat con OpenAI está listo, pero el administrador aún debe configurar OPENAI_API_KEY en el hosting.' });
  if (!Array.isArray(messages) || messages.length === 0 || messages.length > 30) return res.status(400).json({ error: 'Envía una conversación válida.' });
  const safeMessages = messages.filter(m => ['user','assistant'].includes(m.role) && typeof m.content === 'string').map(m => ({ role:m.role, content:m.content.slice(0,12000) }));
+ if (safeMessages.length === 0) return res.status(400).json({ error: 'La conversación no contiene mensajes válidos.' });
  try {
-  const response = await fetch('https://api.anthropic.com/v1/messages', { method:'POST', headers:{ 'content-type':'application/json', 'x-api-key':process.env.ANTHROPIC_API_KEY, 'anthropic-version':'2023-06-01' }, body:JSON.stringify({ model:'claude-sonnet-4-20250514', max_tokens:1200, system:`Eres Lúmina, tutora académica cálida y rigurosa para personas de cualquier nivel. Adapta el vocabulario y complejidad al nivel ${String(level).slice(0,100) || 'indicado por la persona'}. Materia o tema: ${String(subject).slice(0,150) || 'el que solicite la persona'}. Explica paso a paso, fomenta comprensión, pregunta cuando falte contexto y responde en español salvo que la persona pida otro idioma. Si te piden crear imágenes, audio o video, ofrece un prompt o guion útil con claridad: esta instalación no genera archivos multimedia por sí sola.`, messages:safeMessages }) });
+  const response = await fetch('https://api.openai.com/v1/responses', {
+   method:'POST',
+   headers:{ 'content-type':'application/json', 'authorization':`Bearer ${process.env.OPENAI_API_KEY}` },
+   body:JSON.stringify({
+    model:process.env.OPENAI_MODEL || 'gpt-6-luna',
+    max_output_tokens:1200,
+    instructions:`Eres Lúmina, tutora académica cálida y rigurosa para personas de cualquier nivel. Adapta el vocabulario y complejidad al nivel ${String(level).slice(0,100) || 'indicado por la persona'}. Materia o tema: ${String(subject).slice(0,150) || 'el que solicite la persona'}. Explica paso a paso, fomenta comprensión, pregunta cuando falte contexto y responde en español salvo que la persona pida otro idioma. Si te piden crear imágenes, audio o video, ofrece un prompt o guion útil con claridad: esta instalación no genera archivos multimedia por sí sola.`,
+    input:safeMessages
+   })
+  });
   const data = await response.json();
-  if (!response.ok) return res.status(response.status === 429 ? 429 : 502).json({ error: data.error?.message || 'No se pudo conectar con Claude.' });
-  res.json({ reply: data.content?.filter(c=>c.type==='text').map(c=>c.text).join('\n') || 'No recibí una respuesta en texto.' });
- } catch { res.status(502).json({ error: 'No se pudo conectar con Claude. Revisa la conexión e inténtalo otra vez.' }); }
+  if (!response.ok) {
+   if (response.status === 401) return res.status(502).json({ error: 'La clave OPENAI_API_KEY no es válida. Revísala en la configuración de Render.' });
+   if (response.status === 429) return res.status(429).json({ error: 'OpenAI alcanzó el límite de uso o no hay saldo disponible. Revisa tu cuenta de API.' });
+   return res.status(502).json({ error: 'OpenAI no pudo completar la respuesta. Revisa la configuración de la API e inténtalo de nuevo.' });
+  }
+  const reply = data.output?.flatMap(item => item.content || []).filter(part => part.type === 'output_text').map(part => part.text).join('\n');
+  res.json({ reply: reply || 'No recibí una respuesta en texto.' });
+ } catch { res.status(502).json({ error: 'No se pudo conectar con OpenAI. Revisa la conexión e inténtalo otra vez.' }); }
 });
 app.listen(port, '0.0.0.0', () => console.log(`Aula Lúmina disponible en el puerto ${port}`));
