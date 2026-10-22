@@ -1,6 +1,6 @@
 # Aula Lúmina
 
-Plataforma educativa adaptable a móvil y escritorio, en español, para estudiantes y docentes. Incluye chat de estudio con la API de OpenAI, acceso por correo, perfiles, diagnóstico académico de bienvenida, biblioteca de apuntes, cuestionarios, generador de diagramas y preferencias de tema.
+Plataforma educativa adaptable a móvil y escritorio, en español, para estudiantes y docentes. Incluye chat de estudio con la API de OpenAI, acceso por correo, perfiles, diagnóstico académico de bienvenida, biblioteca de apuntes con guías generadas por IA (resumen, tarjetas y cuestionario explicado), generador de diagramas y preferencias de tema.
 
 ## Ejecutar y publicar
 
