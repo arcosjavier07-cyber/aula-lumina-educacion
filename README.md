@@ -1,18 +1,18 @@
 # Aula Lúmina
 
-Plataforma educativa adaptable a móvil y escritorio, en español, para estudiantes y docentes. Incluye chat de estudio con Claude, acceso por correo, perfiles, diagnóstico académico de bienvenida, biblioteca de apuntes, cuestionarios, generador de diagramas y preferencias de tema.
+Plataforma educativa adaptable a móvil y escritorio, en español, para estudiantes y docentes. Incluye chat de estudio con la API de OpenAI, acceso por correo, perfiles, diagnóstico académico de bienvenida, biblioteca de apuntes, cuestionarios, generador de diagramas y preferencias de tema.
 
 ## Ejecutar y publicar
 
-Requiere Node.js 20 o posterior. En esta carpeta, instala dependencias con `npm install`, copia `.env.example` a `.env`, agrega una clave válida de Anthropic a `ANTHROPIC_API_KEY` y arranca con `npm start`; abre `http://localhost:3000`.
+Requiere Node.js 20 o posterior. En esta carpeta, instala dependencias con `npm install`, copia `.env.example` a `.env`, agrega una clave válida de OpenAI a `OPENAI_API_KEY` y arranca con `npm start`; abre `http://localhost:3000`.
 
-La app se puede desplegar como contenedor Docker en un proveedor de hosting que permita volúmenes persistentes y HTTPS. Configura allí `ANTHROPIC_API_KEY`; el proveedor asigna `PORT`. Monta un volumen persistente en `/app/data` y establece `DATA_DIR=/app/data` para conservar las cuentas y la base SQLite después de reinicios.
+La app se puede desplegar como contenedor Docker en un proveedor de hosting que permita volúmenes persistentes y HTTPS. Configura allí `OPENAI_API_KEY` como secreto y, opcionalmente, `OPENAI_MODEL`; el proveedor asigna `PORT`. Monta un volumen persistente en `/app/data` y establece `DATA_DIR=/app/data` para conservar las cuentas y la base SQLite después de reinicios.
 
-## Claude y herramientas multimedia
+## OpenAI y herramientas multimedia
 
-El chat utiliza la API de mensajes de Anthropic desde el servidor y nunca entrega la clave al navegador. Para comprobar la integración, envía una pregunta en el chat después de configurar la clave. Sin clave, se muestra claramente que falta la configuración.
+El chat utiliza la Responses API de OpenAI desde el servidor y nunca entrega la clave al navegador. El modelo predeterminado es `gpt-6-luna`; puedes cambiarlo con `OPENAI_MODEL`. Para comprobar la integración, envía una pregunta en el chat después de configurar la clave. Sin clave, se muestra claramente que falta la configuración.
 
-La interfaz incluye acciones para proponer ilustraciones, guiones de audio y video, además de un diagramador. Claude puede redactar guiones y código Mermaid; la generación real de archivos de imagen, audio o video requiere integrar y configurar un proveedor multimedia con sus propias credenciales. No se anuncia como conectada a esos servicios hasta entonces.
+La interfaz incluye acciones para proponer ilustraciones, guiones de audio y video, además de un diagramador. El asistente puede redactar guiones y código Mermaid; la generación real de archivos de imagen, audio o video requiere integrar y configurar las herramientas multimedia correspondientes. No se anuncia como conectada a esos servicios hasta entonces.
 
 ## Alcance de la versión
 
@@ -20,6 +20,7 @@ Esta primera versión usa sesiones en memoria, una base SQLite y un diagnóstico
 
 ## Instalar en distintos dispositivos
 
-Aula Lúmina es una aplicación web progresiva (PWA), no una app nativa separada. Después de publicarla en un dominio con HTTPS, se puede usar en Windows, macOS, Linux, Android y iPhone/iPad desde un navegador moderno. En Android y escritorio se ofrece «Instalar app» cuando el navegador lo permite. En iPhone/iPad, abre el sitio publicado en Safari, toca Compartir → Añadir a pantalla de inicio → Añadir. Se incluyen iconos PNG y las áreas seguras para la barra de inicio del iPhone. Después abre el icono añadido desde la pantalla de inicio. El modo sin conexión conserva la interfaz pública; el inicio de sesión, la base de datos y Claude requieren conexión.
+Aula Lúmina es una aplicación web progresiva (PWA), no una app nativa separada. Después de publicarla en un dominio con HTTPS, se puede usar en Windows, macOS, Linux, Android y iPhone/iPad desde un navegador moderno. En Android y escritorio se ofrece «Instalar app» cuando el navegador lo permite. En iPhone/iPad, abre el sitio publicado en Safari, toca Compartir → Añadir a pantalla de inicio → Añadir. Se incluyen iconos PNG y las áreas seguras para la barra de inicio del iPhone. Después abre el icono añadido desde la pantalla de inicio. El modo sin conexión conserva la interfaz pública; el inicio de sesión, la base de datos y OpenAI requieren conexión.
 
 Para verla localmente como sitio web, ejecuta `npm install` y `npm start`, y abre `http://localhost:3000`; evita abrir `index.html` directamente con `file://`, ya que los navegadores desactivan las funciones de instalación y caché para archivos locales.
+
