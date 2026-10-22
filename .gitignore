@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+node_modules/
+data/
+*.sqlite
+*.sqlite-*
+sk-*
+npm-debug.log*
