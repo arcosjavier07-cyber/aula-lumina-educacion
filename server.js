@@ -23,6 +23,31 @@ db.exec(`CREATE TABLE IF NOT EXISTS users (
  details TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );`);
 const sessions = new Map();
+const mediaRequests = new Map();
+const mediaFeatureEnabled = () => process.env.OPENAI_MEDIA_ENABLED === 'true';
+function allowMediaRequest(req, res, kind, limit) {
+ const key = `${req.user.id}:${kind}`;
+ const now = Date.now();
+ const windowMs = 10 * 60 * 1000;
+ const record = mediaRequests.get(key);
+ if (!record || now - record.startedAt >= windowMs) {
+  mediaRequests.set(key, { startedAt: now, count: 1 });
+  return true;
+ }
+ if (record.count >= limit) {
+  res.set('Retry-After', String(Math.ceil((windowMs - (now - record.startedAt)) / 1000)));
+  res.status(429).json({ error: 'Llegaste al límite temporal de esta herramienta. Inténtalo más tarde.' });
+  return false;
+ }
+ record.count += 1;
+ return true;
+}
+function openAIServiceError(status) {
+ if (status === 401) return 'La clave OPENAI_API_KEY no es válida. Revísala en la configuración de Render.';
+ if (status === 403) return 'OpenAI no autorizó esta herramienta. Revisa el acceso y la verificación de tu organización en la plataforma de OpenAI.';
+ if (status === 429) return 'OpenAI alcanzó el límite de uso o no hay saldo disponible. Revisa tu cuenta de API.';
+ return 'OpenAI no pudo completar la solicitud. Revisa la configuración de la API e inténtalo de nuevo.';
+}
 const safeEqual = (a, b) => {
  const aa = Buffer.from(a); const bb = Buffer.from(b);
  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
@@ -72,7 +97,7 @@ app.post('/api/chat', auth, async (req,res) => {
    body:JSON.stringify({
     model:process.env.OPENAI_MODEL || 'gpt-6-luna',
     max_output_tokens:1200,
-    instructions:`Eres Lúmina, tutora académica cálida y rigurosa para personas de cualquier nivel. Adapta el vocabulario y complejidad al nivel ${String(level).slice(0,100) || 'indicado por la persona'}. Materia o tema: ${String(subject).slice(0,150) || 'el que solicite la persona'}. Explica paso a paso, fomenta comprensión, pregunta cuando falte contexto y responde en español salvo que la persona pida otro idioma. Si te piden crear imágenes, audio o video, ofrece un prompt o guion útil con claridad: esta instalación no genera archivos multimedia por sí sola.`,
+    instructions:`Eres Lúmina, tutora académica cálida y rigurosa para personas de cualquier nivel. Adapta el vocabulario y complejidad al nivel ${String(level).slice(0,100) || 'indicado por la persona'}. Materia o tema: ${String(subject).slice(0,150) || 'el que solicite la persona'}. Explica paso a paso, fomenta comprensión, pregunta cuando falte contexto y responde en español salvo que la persona pida otro idioma. Si la persona quiere generar una imagen o audio, indícale usar el botón correspondiente: la aplicación puede generar imágenes y convertir texto a voz cuando el administrador active las herramientas. Si pide video, aclara que puedes redactar un guion, pero esta instalación aún no crea el archivo de video.`,
     input:safeMessages
    })
   });
@@ -85,5 +110,60 @@ app.post('/api/chat', auth, async (req,res) => {
   const reply = data.output?.flatMap(item => item.content || []).filter(part => part.type === 'output_text').map(part => part.text).join('\n');
   res.json({ reply: reply || 'No recibí una respuesta en texto.' });
  } catch { res.status(502).json({ error: 'No se pudo conectar con OpenAI. Revisa la conexión e inténtalo otra vez.' }); }
+});
+app.post('/api/image', auth, async (req, res) => {
+ if (!mediaFeatureEnabled()) return res.status(503).json({ error: 'La generación multimedia está desactivada. El administrador debe configurarla en Render.' });
+ if (!process.env.OPENAI_API_KEY) return res.status(503).json({ error: 'El administrador aún debe configurar OPENAI_API_KEY en el hosting.' });
+ const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : '';
+ if (prompt.length < 4 || prompt.length > 3000) return res.status(400).json({ error: 'Describe la imagen con entre 4 y 3000 caracteres.' });
+ if (!allowMediaRequest(req, res, 'image', 3)) return;
+ try {
+  const response = await fetch('https://api.openai.com/v1/images/generations', {
+   method: 'POST',
+   headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+   body: JSON.stringify({
+    model: process.env.OPENAI_IMAGE_MODEL || 'gpt-image-2.5-flare',
+    prompt,
+    size: '1024x1024',
+    quality: 'medium',
+    output_format: 'png',
+    n: 1,
+    safety_identifier: crypto.createHash('sha256').update(String(req.user.id)).digest('hex')
+   }),
+   signal: AbortSignal.timeout(120000)
+  });
+  const data = await response.json();
+  if (!response.ok) return res.status(response.status === 401 ? 502 : response.status === 429 ? 429 : 502).json({ error: openAIServiceError(response.status) });
+  const image = data.data?.[0]?.b64_json;
+  if (!image) return res.status(502).json({ error: 'OpenAI no devolvió una imagen. Inténtalo con otra descripción.' });
+  res.json({ image, mimeType: 'image/png' });
+ } catch (error) {
+  if (error?.name === 'TimeoutError') return res.status(504).json({ error: 'La imagen está tardando demasiado. Prueba de nuevo con una descripción más breve.' });
+  res.status(502).json({ error: 'No se pudo conectar con el servicio de imágenes de OpenAI.' });
+ }
+});
+app.post('/api/audio', auth, async (req, res) => {
+ if (!mediaFeatureEnabled()) return res.status(503).json({ error: 'La generación multimedia está desactivada. El administrador debe configurarla en Render.' });
+ if (!process.env.OPENAI_API_KEY) return res.status(503).json({ error: 'El administrador aún debe configurar OPENAI_API_KEY en el hosting.' });
+ const input = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+ if (!input || input.length > 4000) return res.status(400).json({ error: 'Escribe un texto de hasta 4000 caracteres para convertirlo en audio.' });
+ if (!allowMediaRequest(req, res, 'audio', 6)) return;
+ try {
+  const response = await fetch('https://api.openai.com/v1/audio/speech', {
+   method: 'POST',
+   headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+   body: JSON.stringify({ model: process.env.OPENAI_TTS_MODEL || 'gpt-4o-mini-tts', voice: 'marin', input, response_format: 'mp3' }),
+   signal: AbortSignal.timeout(60000)
+  });
+  if (!response.ok) {
+   const status = response.status;
+   return res.status(status === 401 ? 502 : status === 429 ? 429 : 502).json({ error: openAIServiceError(status) });
+  }
+  const audio = Buffer.from(await response.arrayBuffer()).toString('base64');
+  res.json({ audio, mimeType: 'audio/mpeg' });
+ } catch (error) {
+  if (error?.name === 'TimeoutError') return res.status(504).json({ error: 'El audio está tardando demasiado. Inténtalo otra vez.' });
+  res.status(502).json({ error: 'No se pudo conectar con el servicio de audio de OpenAI.' });
+ }
 });
 app.listen(port, '0.0.0.0', () => console.log(`Aula Lúmina disponible en el puerto ${port}`));

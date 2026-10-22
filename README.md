@@ -10,9 +10,11 @@ La app se puede desplegar como contenedor Docker en un proveedor de hosting que 
 
 ## OpenAI y herramientas multimedia
 
-El chat utiliza la Responses API de OpenAI desde el servidor y nunca entrega la clave al navegador. El modelo predeterminado es `gpt-6-luna`; puedes cambiarlo con `OPENAI_MODEL`. Para comprobar la integración, envía una pregunta en el chat después de configurar la clave. Sin clave, se muestra claramente que falta la configuración.
+El chat utiliza la Responses API de OpenAI desde el servidor y nunca entrega la clave al navegador. El modelo predeterminado es `gpt-6-luna`; puedes cambiarlo con `OPENAI_MODEL`.
 
-La interfaz incluye acciones para proponer ilustraciones, guiones de audio y video, además de un diagramador. El asistente puede redactar guiones y código Mermaid; la generación real de archivos de imagen, audio o video requiere integrar y configurar las herramientas multimedia correspondientes. No se anuncia como conectada a esos servicios hasta entonces.
+La generación real de imágenes usa la Images API; la conversión de texto a voz usa la API de audio de OpenAI. Ambas se mantienen desactivadas de forma predeterminada. Para activarlas, configura `OPENAI_MEDIA_ENABLED=true` en el hosting y agrega una clave de API con acceso a esos modelos. Puedes cambiar los modelos con `OPENAI_IMAGE_MODEL` y `OPENAI_TTS_MODEL`. Cada cuenta tiene límites temporales para evitar solicitudes repetidas; las llamadas pueden generar cargos de API. La cuenta también puede requerir verificación para generación de imágenes.
+
+La interfaz permite crear imágenes y audios. El botón de video prepara un guion, pero no genera el archivo: OpenAI retiró la Videos API y Sora 2 el 24 de septiembre de 2026. Para generar videos habrá que conectar un proveedor de video distinto y configurar su clave por separado.
 
 ## Alcance de la versión
 
