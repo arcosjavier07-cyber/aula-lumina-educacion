@@ -2,7 +2,7 @@
   "name": "aula-lumina",
   "version": "1.0.0",
   "private": true,
-  "description": "Plataforma academica con asistente conectado a Claude de Anthropic.",
+  "description": "Plataforma académica con asistente conectado a la API de OpenAI.",
   "scripts": { "start": "node server.js" },
   "dependencies": { "better-sqlite3": "^12.2.0", "dotenv": "^16.6.1", "express": "^5.1.0", "helmet": "^8.1.0" },
   "engines": { "node": ">=20" }
