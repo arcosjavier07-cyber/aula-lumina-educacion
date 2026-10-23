@@ -63,9 +63,16 @@ async function initializeDatabase() {
   await pgPool.query(`CREATE TABLE IF NOT EXISTS study_notes (
    id BIGSERIAL PRIMARY KEY, owner_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
    client_id TEXT, name TEXT NOT NULL, content TEXT NOT NULL DEFAULT '',
-   visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private','general')),
+   visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private','class','general')),
    study_guide TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
    UNIQUE(owner_id,client_id)
+  )`);
+  await pgPool.query('ALTER TABLE study_notes DROP CONSTRAINT IF EXISTS study_notes_visibility_check');
+  await pgPool.query("ALTER TABLE study_notes ADD CONSTRAINT study_notes_visibility_check CHECK (visibility IN ('private','class','general'))");
+  await pgPool.query(`CREATE TABLE IF NOT EXISTS study_note_classes (
+   note_id BIGINT NOT NULL REFERENCES study_notes(id) ON DELETE CASCADE,
+   class_id BIGINT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+   PRIMARY KEY(note_id,class_id)
   )`);
   await pgPool.query('CREATE INDEX IF NOT EXISTS study_notes_visibility_updated_idx ON study_notes(visibility,updated_at DESC)');
   await pgPool.query('CREATE INDEX IF NOT EXISTS assignments_class_due_idx ON assignments(class_id,due_at)');
@@ -123,7 +130,6 @@ async function initializeDatabase() {
    study_guide TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
    UNIQUE(owner_id,client_id)
   );
-  CREATE INDEX IF NOT EXISTS study_notes_visibility_updated_idx ON study_notes(visibility,updated_at DESC);
   CREATE TABLE IF NOT EXISTS sessions (
    token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
    expires_at TEXT NOT NULL
@@ -131,6 +137,30 @@ async function initializeDatabase() {
   CREATE INDEX IF NOT EXISTS class_roster_student_idx ON class_roster(student_id);
   CREATE INDEX IF NOT EXISTS assignments_class_due_idx ON assignments(class_id,due_at);
   CREATE INDEX IF NOT EXISTS assignment_submissions_student_idx ON assignment_submissions(student_id);`);
+  const noteSchema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='study_notes'").get()?.sql || '';
+  if (!noteSchema.includes("'class'")) {
+   db.exec(`PRAGMA foreign_keys=OFF;
+    BEGIN;
+    CREATE TABLE study_notes_migrating (
+     id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+     client_id TEXT, name TEXT NOT NULL, content TEXT NOT NULL DEFAULT '',
+     visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private','class','general')),
+     study_guide TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     UNIQUE(owner_id,client_id)
+    );
+    INSERT INTO study_notes_migrating (id,owner_id,client_id,name,content,visibility,study_guide,created_at,updated_at)
+     SELECT id,owner_id,client_id,name,content,visibility,study_guide,created_at,updated_at FROM study_notes;
+    DROP TABLE study_notes;
+    ALTER TABLE study_notes_migrating RENAME TO study_notes;
+    COMMIT;
+    PRAGMA foreign_keys=ON;`);
+  }
+  db.exec(`CREATE TABLE IF NOT EXISTS study_note_classes (
+   note_id INTEGER NOT NULL REFERENCES study_notes(id) ON DELETE CASCADE,
+   class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+   PRIMARY KEY(note_id,class_id)
+  );
+  CREATE INDEX IF NOT EXISTS study_notes_visibility_updated_idx ON study_notes(visibility,updated_at DESC);`);
   const oldStudents = db.prepare("SELECT id,details FROM users WHERE profile='alumno'").all();
   const addStudentProfile = db.prepare('INSERT OR IGNORE INTO student_profiles (user_id,matricula) VALUES (?,?)');
   for (const user of oldStudents) {
@@ -207,37 +237,91 @@ function publicStudyNote(row, userId) {
  const ownerId = Number(row.owner_id);
  const text = String(row.content || '');
  const timestamp = row.updated_at || row.created_at;
- return { id:Number(row.id), ownerId, ownerName:row.owner_name || '', isOwner:ownerId === Number(userId), name:row.name, text, visibility:row.visibility, size:`${Math.max(1, Math.ceil(Buffer.byteLength(text, 'utf8') / 1024))} KB`, date:timestamp ? new Date(timestamp).toLocaleDateString('es-MX') : '', studyGuide };
+ let sharedClasses=[];
+ try { sharedClasses=Array.isArray(row.shared_classes)?row.shared_classes:JSON.parse(row.shared_classes||'[]'); } catch {}
+ sharedClasses=sharedClasses.map(item=>({id:Number(item.id),name:String(item.name||'')}));
+ return { id:Number(row.id), ownerId, ownerName:row.owner_name || '', isOwner:ownerId === Number(userId), name:row.name, text, visibility:row.visibility, sharedClassIds:sharedClasses.map(item=>item.id), sharedClassNames:sharedClasses.map(item=>item.name), size:`${Math.max(1, Math.ceil(Buffer.byteLength(text, 'utf8') / 1024))} KB`, date:timestamp ? new Date(timestamp).toLocaleDateString('es-MX') : '', studyGuide };
+}
+const noteClassesSelect = `(SELECT json_agg(json_build_object('id',c.id,'name',c.name) ORDER BY c.name) FROM study_note_classes snc JOIN classes c ON c.id=snc.class_id WHERE snc.note_id=n.id)`;
+const sqliteNoteClassesSelect = `(SELECT json_group_array(json_object('id',c.id,'name',c.name)) FROM study_note_classes snc JOIN classes c ON c.id=snc.class_id WHERE snc.note_id=n.id)`;
+function noteAccessSql(userIdParam) {
+ return `(n.owner_id=${userIdParam} OR n.visibility='general' OR (n.visibility='class' AND EXISTS (
+   SELECT 1 FROM study_note_classes snc JOIN classes c ON c.id=snc.class_id
+   WHERE snc.note_id=n.id AND (c.teacher_id=${userIdParam} OR EXISTS (
+    SELECT 1 FROM class_roster r WHERE r.class_id=c.id AND r.student_id=${userIdParam}
+   ))
+  )))`;
 }
 async function listStudyNotes(userId) {
  const rows = postgres
-  ? (await pgPool.query(`SELECT n.*,u.name AS owner_name FROM study_notes n JOIN users u ON u.id=n.owner_id
-      WHERE n.owner_id=$1 OR n.visibility='general' ORDER BY n.updated_at DESC,n.id DESC`,[userId])).rows
-  : db.prepare(`SELECT n.*,u.name AS owner_name FROM study_notes n JOIN users u ON u.id=n.owner_id
-      WHERE n.owner_id=? OR n.visibility='general' ORDER BY n.updated_at DESC,n.id DESC`).all(userId);
+  ? (await pgPool.query(`SELECT n.*,u.name AS owner_name,COALESCE(${noteClassesSelect},'[]'::json) AS shared_classes FROM study_notes n JOIN users u ON u.id=n.owner_id
+      WHERE ${noteAccessSql('$1')} ORDER BY n.updated_at DESC,n.id DESC`,[userId])).rows
+  : db.prepare(`SELECT n.*,u.name AS owner_name,COALESCE(${sqliteNoteClassesSelect},'[]') AS shared_classes FROM study_notes n JOIN users u ON u.id=n.owner_id
+      WHERE ${noteAccessSql('?')} ORDER BY n.updated_at DESC,n.id DESC`).all(userId,userId,userId);
  return rows.map(row=>publicStudyNote(row,userId));
+}
+function validClassIds(rawIds) {
+ return [...new Set((Array.isArray(rawIds)?rawIds:[]).map(Number).filter(id=>Number.isSafeInteger(id)&&id>0))].slice(0,30);
+}
+async function getShareableClassIds(user, classIds) {
+ if (!classIds.length) return [];
+ const rows=postgres
+  ? (await pgPool.query(`SELECT c.id FROM classes c WHERE c.id=ANY($1::bigint[]) AND (c.teacher_id=$2 OR EXISTS (SELECT 1 FROM class_roster r WHERE r.class_id=c.id AND r.student_id=$2))`,[classIds,user.id])).rows
+  : db.prepare(`SELECT c.id FROM classes c WHERE c.id IN (${classIds.map(()=>'?').join(',')}) AND (c.teacher_id=? OR EXISTS (SELECT 1 FROM class_roster r WHERE r.class_id=c.id AND r.student_id=?))`).all(...classIds,user.id,user.id);
+ return rows.map(row=>Number(row.id));
+}
+function syncNoteClassesSqlite(noteId, classIds) {
+ db.prepare('DELETE FROM study_note_classes WHERE note_id=?').run(noteId);
+ const insert=db.prepare('INSERT INTO study_note_classes (note_id,class_id) VALUES (?,?)');
+ for(const classId of classIds)insert.run(noteId,classId);
 }
 async function createStudyNote(userId, data) {
  const clientId = String(data.clientId || crypto.randomUUID()).slice(0,80);
- let row;
+ let row,sharedClasses=[];
  if (postgres) {
-  row=(await pgPool.query(`INSERT INTO study_notes (owner_id,client_id,name,content,visibility,study_guide)
-    VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(owner_id,client_id) DO UPDATE SET client_id=EXCLUDED.client_id RETURNING *`,
+  const client=await pgPool.connect();
+  try {
+   await client.query('BEGIN');
+   row=(await client.query(`INSERT INTO study_notes (owner_id,client_id,name,content,visibility,study_guide)
+    VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(owner_id,client_id) DO UPDATE SET name=EXCLUDED.name,content=EXCLUDED.content,visibility=EXCLUDED.visibility,study_guide=EXCLUDED.study_guide,updated_at=NOW() RETURNING *`,
     [userId,clientId,data.name,data.content,data.visibility,data.studyGuide?JSON.stringify(data.studyGuide):null])).rows[0];
+   await client.query('DELETE FROM study_note_classes WHERE note_id=$1',[row.id]);
+   for(const classId of data.classIds) await client.query('INSERT INTO study_note_classes (note_id,class_id) VALUES ($1,$2)',[row.id,classId]);
+   sharedClasses=(await client.query(`SELECT c.id,c.name FROM study_note_classes snc JOIN classes c ON c.id=snc.class_id WHERE snc.note_id=$1 ORDER BY c.name`,[row.id])).rows;
+   await client.query('COMMIT');
+  } catch(error) { await client.query('ROLLBACK'); throw error; }
+  finally { client.release(); }
  } else {
-  db.prepare(`INSERT OR IGNORE INTO study_notes (owner_id,client_id,name,content,visibility,study_guide) VALUES (?,?,?,?,?,?)`)
+  const save=db.transaction(()=>{
+   db.prepare(`INSERT INTO study_notes (owner_id,client_id,name,content,visibility,study_guide) VALUES (?,?,?,?,?,?)
+    ON CONFLICT(owner_id,client_id) DO UPDATE SET name=excluded.name,content=excluded.content,visibility=excluded.visibility,study_guide=excluded.study_guide,updated_at=CURRENT_TIMESTAMP`)
     .run(userId,clientId,data.name,data.content,data.visibility,data.studyGuide?JSON.stringify(data.studyGuide):null);
-  row=db.prepare('SELECT * FROM study_notes WHERE owner_id=? AND client_id=?').get(userId,clientId);
+   row=db.prepare('SELECT * FROM study_notes WHERE owner_id=? AND client_id=?').get(userId,clientId);
+   syncNoteClassesSqlite(row.id,data.classIds);
+   sharedClasses=db.prepare('SELECT c.id,c.name FROM study_note_classes snc JOIN classes c ON c.id=snc.class_id WHERE snc.note_id=? ORDER BY c.name').all(row.id);
+  });
+  save();
  }
+ row.shared_classes=sharedClasses;
  return publicStudyNote(row,userId);
 }
 async function updateStudyNote(userId, noteId, data) {
- const row=postgres
-  ? (await pgPool.query(`UPDATE study_notes SET name=$1,content=$2,visibility=$3,study_guide=$4,updated_at=NOW()
-      WHERE id=$5 AND owner_id=$6 RETURNING *`,[data.name,data.content,data.visibility,data.studyGuide?JSON.stringify(data.studyGuide):null,noteId,userId])).rows[0]
-  : (()=>{const changed=db.prepare(`UPDATE study_notes SET name=?,content=?,visibility=?,study_guide=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND owner_id=?`)
-      .run(data.name,data.content,data.visibility,data.studyGuide?JSON.stringify(data.studyGuide):null,noteId,userId).changes;
-      return changed?db.prepare('SELECT * FROM study_notes WHERE id=? AND owner_id=?').get(noteId,userId):null;})();
+ let row,sharedClasses=[];
+ if(postgres) {
+  const client=await pgPool.connect();
+  try {
+   await client.query('BEGIN');
+   row=(await client.query(`UPDATE study_notes SET name=$1,content=$2,visibility=$3,study_guide=$4,updated_at=NOW() WHERE id=$5 AND owner_id=$6 RETURNING *`,[data.name,data.content,data.visibility,data.studyGuide?JSON.stringify(data.studyGuide):null,noteId,userId])).rows[0];
+   if(row){await client.query('DELETE FROM study_note_classes WHERE note_id=$1',[noteId]);for(const classId of data.classIds)await client.query('INSERT INTO study_note_classes (note_id,class_id) VALUES ($1,$2)',[noteId,classId]);sharedClasses=(await client.query('SELECT c.id,c.name FROM study_note_classes snc JOIN classes c ON c.id=snc.class_id WHERE snc.note_id=$1 ORDER BY c.name',[noteId])).rows;}
+   await client.query('COMMIT');
+  } catch(error) { await client.query('ROLLBACK'); throw error; }
+  finally { client.release(); }
+ } else {
+  const save=db.transaction(()=>{const changed=db.prepare(`UPDATE study_notes SET name=?,content=?,visibility=?,study_guide=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND owner_id=?`).run(data.name,data.content,data.visibility,data.studyGuide?JSON.stringify(data.studyGuide):null,noteId,userId).changes;
+   if(changed){row=db.prepare('SELECT * FROM study_notes WHERE id=? AND owner_id=?').get(noteId,userId);syncNoteClassesSqlite(noteId,data.classIds);sharedClasses=db.prepare('SELECT c.id,c.name FROM study_note_classes snc JOIN classes c ON c.id=snc.class_id WHERE snc.note_id=? ORDER BY c.name').all(noteId);}});
+  save();
+ }
+ if(row)row.shared_classes=sharedClasses;
  return row?publicStudyNote(row,userId):null;
 }
 async function deleteStudyNote(userId, noteId) {
@@ -248,8 +332,8 @@ async function getNotesForAI(userId, rawIds) {
  const ids=[...new Set((Array.isArray(rawIds)?rawIds:[]).map(Number).filter(id=>Number.isSafeInteger(id)&&id>0))].slice(0,6);
  if (!ids.length) return [];
  const rows=postgres
-  ? (await pgPool.query(`SELECT id,name,content FROM study_notes WHERE id=ANY($1::bigint[]) AND (owner_id=$2 OR visibility='general')`,[ids,userId])).rows
-  : db.prepare(`SELECT id,name,content FROM study_notes WHERE id IN (${ids.map(()=>'?').join(',')}) AND (owner_id=? OR visibility='general')`).all(...ids,userId);
+  ? (await pgPool.query(`SELECT n.id,n.name,n.content FROM study_notes n WHERE n.id=ANY($1::bigint[]) AND ${noteAccessSql('$2')}`,[ids,userId])).rows
+  : db.prepare(`SELECT n.id,n.name,n.content FROM study_notes n WHERE n.id IN (${ids.map(()=>'?').join(',')}) AND ${noteAccessSql('?')}`).all(...ids,userId,userId,userId);
  const byId=new Map(rows.map(row=>[Number(row.id),row]));let remaining=14000;const selected=[];
  for(const id of ids){const note=byId.get(id);if(!note||remaining<=0)continue;const content=String(note.content||'').trim().slice(0,Math.min(5000,remaining));if(!content)continue;selected.push({name:String(note.name).slice(0,100),content});remaining-=content.length;}
  return selected;
@@ -549,20 +633,26 @@ app.get('/api/notes', auth, async (req,res) => {
 app.post('/api/notes', auth, async (req,res) => {
  const name=typeof req.body?.name==='string'?req.body.name.trim().slice(0,100):'';
  const content=typeof req.body?.text==='string'?req.body.text.trim():'';
- const visibility=req.body?.visibility==='general'?'general':'private';
+ const visibility=['general','class'].includes(req.body?.visibility)?req.body.visibility:'private';
+ const classIds=validClassIds(req.body?.classIds);
  const clientId=typeof req.body?.clientId==='string'?req.body.clientId.slice(0,80):crypto.randomUUID();
  let studyGuide=null;
  if(req.body?.studyGuide&&typeof req.body.studyGuide==='object'&&!Array.isArray(req.body.studyGuide))studyGuide=req.body.studyGuide;
  if(!name||content.length>25000)return res.status(400).json({error:'Escribe un nombre y usa un texto de hasta 25,000 caracteres.'});
- try { const note=await createStudyNote(req.user.id,{name,content,visibility,clientId,studyGuide});res.status(201).json({note}); }
+ if(visibility==='class'&&!classIds.length)return res.status(400).json({error:'Elige al menos una clase para compartir este apunte.'});
+ try { if(visibility==='class'&&(await getShareableClassIds(req.user,classIds)).length!==classIds.length)return res.status(403).json({error:'Solo puedes compartir apuntes con clases a las que perteneces o que impartes.'});
+  const note=await createStudyNote(req.user.id,{name,content,visibility,classIds:visibility==='class'?classIds:[],clientId,studyGuide});res.status(201).json({note}); }
  catch(error) { console.error('No se pudo guardar el apunte:',error.message);res.status(503).json({error:'No se pudo guardar el apunte. Inténtalo de nuevo.'}); }
 });
 app.put('/api/notes/:id', auth, async (req,res) => {
  const noteId=Number(req.params.id),name=typeof req.body?.name==='string'?req.body.name.trim().slice(0,100):'',content=typeof req.body?.text==='string'?req.body.text.trim():'';
- const visibility=req.body?.visibility==='general'?'general':'private';
+ const visibility=['general','class'].includes(req.body?.visibility)?req.body.visibility:'private';
+ const classIds=validClassIds(req.body?.classIds);
  const studyGuide=req.body?.studyGuide&&typeof req.body.studyGuide==='object'&&!Array.isArray(req.body.studyGuide)?req.body.studyGuide:null;
  if(!Number.isSafeInteger(noteId)||noteId<1||!name||content.length>25000)return res.status(400).json({error:'El apunte no es válido o supera los 25,000 caracteres.'});
- try { const note=await updateStudyNote(req.user.id,noteId,{name,content,visibility,studyGuide});if(!note)return res.status(404).json({error:'El apunte ya no está disponible o no tienes permiso para editarlo.'});res.json({note}); }
+ if(visibility==='class'&&!classIds.length)return res.status(400).json({error:'Elige al menos una clase para compartir este apunte.'});
+ try { if(visibility==='class'&&(await getShareableClassIds(req.user,classIds)).length!==classIds.length)return res.status(403).json({error:'Solo puedes compartir apuntes con clases a las que perteneces o que impartes.'});
+  const note=await updateStudyNote(req.user.id,noteId,{name,content,visibility,classIds:visibility==='class'?classIds:[],studyGuide});if(!note)return res.status(404).json({error:'El apunte ya no está disponible o no tienes permiso para editarlo.'});res.json({note}); }
  catch(error) { console.error('No se pudo actualizar el apunte:',error.message);res.status(503).json({error:'No se pudo actualizar el apunte. Inténtalo de nuevo.'}); }
 });
 app.delete('/api/notes/:id', auth, async (req,res) => {
