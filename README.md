@@ -30,11 +30,13 @@ Cada docente puede publicar tareas para los grupos que administra, con instrucci
 
 Requiere Node.js 20 o posterior. En esta carpeta ejecuta `npm install`, copia `.env.example` a `.env`, agrega una clave de OpenAI válida en `OPENAI_API_KEY` y arranca con `npm start`; abre `http://localhost:3000`. Deja `DATABASE_URL` vacío para usar SQLite local.
 
-## OpenAI y herramientas multimedia
+## OpenAI, Gemini y Cloudflare
 
-El chat utiliza la Responses API de OpenAI desde el servidor y nunca entrega la clave al navegador. El modelo predeterminado es `gpt-6-luna`; puedes cambiarlo con `OPENAI_MODEL`.
+El chat y las respuestas de texto utilizan la Responses API de OpenAI desde el servidor y nunca entregan la clave al navegador. El modelo predeterminado es `gpt-6-luna`; puedes cambiarlo con `OPENAI_MODEL`.
 
-La generación real de imágenes usa la Images API y la conversión de texto a voz usa la API de audio de OpenAI. Ambas están desactivadas por defecto. Para activarlas, configura `OPENAI_MEDIA_ENABLED=true` en Render y agrega una clave con acceso y saldo disponibles. Puedes cambiar `OPENAI_IMAGE_MODEL` y `OPENAI_TTS_MODEL`. Las llamadas multimedia pueden generar cargos de API y la cuenta puede requerir verificación para generar imágenes.
+Las imágenes se generan con Cloudflare Workers AI (modelo predeterminado `@cf/black-forest-labs/flux-1-schnell`) y el audio leído en voz alta con Gemini TTS (modelo predeterminado `gemini-3.8-flash-lite-tts`). Para activarlos, configura `MEDIA_ENABLED=true`, `GEMINI_API_KEY`, `CLOUDFLARE_ACCOUNT_ID` y `CLOUDFLARE_API_TOKEN` en Render. Las claves solo se usan en el servidor. Puedes cambiar `GEMINI_TTS_MODEL`, `GEMINI_TTS_VOICE` y `CLOUDFLARE_IMAGE_MODEL`. La variable anterior `OPENAI_MEDIA_ENABLED` sigue funcionando si ya está configurada.
+
+Gemini TTS devuelve WAV; la aplicación informa el formato al reproductor. Las solicitudes de imágenes se limitan a 2048 caracteres por los requisitos de FLUX. Ambos proveedores tienen cuotas y pueden generar cargos o rechazar solicitudes al agotarse el límite. En el nivel gratuito de Gemini, Google puede usar las solicitudes y respuestas para mejorar productos; para trabajar con información escolar sensible, revisa las condiciones y la modalidad del proyecto antes de enviar datos personales o apuntes.
 
 El botón de video prepara un guion, pero no genera un archivo de video. Para eso se necesita conectar un proveedor de video distinto y configurar su clave por separado.
 

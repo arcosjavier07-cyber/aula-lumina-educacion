@@ -20,7 +20,7 @@ let db = null;
 function parseDetails(value) { return typeof value === 'string' ? JSON.parse(value || '{}') : (value || {}); }
 function publicUser(row) {
  if (!row) return null;
- return { id: Number(row.id), name: row.name, email: row.email, profile: row.profile, details: parseDetails(row.details), created_at: row.created_at };
+ return { id: Number(row.id), name: row.name, email: row.email, profile: row.profile, details: parseDetails(row.details), avatar: row.avatar_data_url || null, created_at: row.created_at };
 }
 async function initializeDatabase() {
  if (postgres) {
@@ -28,6 +28,10 @@ async function initializeDatabase() {
    id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
    password_hash TEXT NOT NULL, salt TEXT NOT NULL, profile TEXT NOT NULL,
    details JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await pgPool.query(`CREATE TABLE IF NOT EXISTS user_avatars (
+   user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+   data_url TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
   await pgPool.query(`CREATE TABLE IF NOT EXISTS student_profiles (
    user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -72,6 +76,10 @@ async function initializeDatabase() {
    id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
    password_hash TEXT NOT NULL, salt TEXT NOT NULL, profile TEXT NOT NULL,
    details TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS user_avatars (
+   user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+   data_url TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
   CREATE TABLE IF NOT EXISTS student_profiles (
    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -125,8 +133,8 @@ async function getSessionUser(token) {
  if (!token) return null;
  const digest = hashToken(token), now = new Date().toISOString();
  const row = postgres
-  ? (await pgPool.query('SELECT u.id,u.name,u.email,u.profile,u.details,u.created_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>$2::timestamptz', [digest, now])).rows[0]
-  : db.prepare('SELECT u.id,u.name,u.email,u.profile,u.details,u.created_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?').get(digest, now);
+  ? (await pgPool.query('SELECT u.id,u.name,u.email,u.profile,u.details,u.created_at,av.data_url AS avatar_data_url FROM sessions s JOIN users u ON u.id=s.user_id LEFT JOIN user_avatars av ON av.user_id=u.id WHERE s.token_hash=$1 AND s.expires_at>$2::timestamptz', [digest, now])).rows[0]
+  : db.prepare('SELECT u.id,u.name,u.email,u.profile,u.details,u.created_at,av.data_url AS avatar_data_url FROM sessions s JOIN users u ON u.id=s.user_id LEFT JOIN user_avatars av ON av.user_id=u.id WHERE s.token_hash=? AND s.expires_at>?').get(digest, now);
  return publicUser(row);
 }
 async function createSession(userId) {
@@ -178,7 +186,7 @@ async function updateDetails(userId, details) {
  return merged;
 }
 const mediaRequests = new Map();
-const mediaFeatureEnabled = () => process.env.OPENAI_MEDIA_ENABLED === 'true';
+const mediaFeatureEnabled = () => (process.env.MEDIA_ENABLED ?? process.env.OPENAI_MEDIA_ENABLED) === 'true';
 function ageFromBirthDate(value) {
  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
  const [year, month, day] = value.split('-').map(Number);
@@ -230,8 +238,9 @@ app.post('/api/register', async (req, res) => {
  const age = ageFromBirthDate(details.birth);
  const academicLevel = profile === 'alumno' ? details.level : details.teachLevels || details.level;
  if (!name?.trim() || !/^\S+@\S+\.\S+$/.test(email || '') || (password || '').length < 8 || !['alumno','profesor'].includes(profile) || !age || !String(academicLevel || '').trim()) return res.status(400).json({ error: 'Completa los campos obligatorios, indica tu nivel académico y usa una fecha de nacimiento válida. La contraseña debe tener al menos 8 caracteres.' });
- if (profile === 'alumno' && String(academicLevel).trim() === 'Universidad' && !String(details.studentId || '').trim()) return res.status(400).json({ error: 'La matrícula es obligatoria para estudiantes de universidad.' });
- const savedDetails = { ...details, age, level: String(academicLevel).trim(), studentId: String(details.studentId || '').trim().toUpperCase() };
+ const studentId = String(details.studentId || '').trim().toUpperCase();
+ if (profile === 'alumno' && String(academicLevel).trim() === 'Universidad' && !/^[A-Z0-9._-]{3,40}$/.test(studentId)) return res.status(400).json({ error: 'La matrícula universitaria debe tener entre 3 y 40 letras, números, puntos, guiones o guiones bajos.' });
+ const savedDetails = { ...details, age, level: String(academicLevel).trim(), studentId };
  const salt = crypto.randomBytes(16).toString('hex');
  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
  try {
@@ -245,8 +254,8 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
  const { email, password } = req.body || {};
  const user = postgres
-  ? (await pgPool.query('SELECT id,name,email,profile,details,password_hash,salt,created_at FROM users WHERE email=$1',[(email || '').toLowerCase().trim()])).rows[0]
-  : db.prepare('SELECT id,name,email,profile,details,password_hash,salt,created_at FROM users WHERE email=?').get((email || '').toLowerCase().trim());
+  ? (await pgPool.query('SELECT u.id,u.name,u.email,u.profile,u.details,u.password_hash,u.salt,u.created_at,av.data_url AS avatar_data_url FROM users u LEFT JOIN user_avatars av ON av.user_id=u.id WHERE u.email=$1',[(email || '').toLowerCase().trim()])).rows[0]
+  : db.prepare('SELECT u.id,u.name,u.email,u.profile,u.details,u.password_hash,u.salt,u.created_at,av.data_url AS avatar_data_url FROM users u LEFT JOIN user_avatars av ON av.user_id=u.id WHERE u.email=?').get((email || '').toLowerCase().trim());
  if (!user || !safeEqual(crypto.scryptSync(password || '', user.salt, 64).toString('hex'), user.password_hash)) return res.status(401).json({ error: 'Correo o contraseña incorrectos.' });
  const token = await createSession(user.id);
  res.json({ token, user: publicUser(user) });
@@ -299,6 +308,23 @@ app.post('/api/profile', auth, async (req,res) => {
  const updated = await updateDetails(req.user.id, details);
  res.json({ ok:true, details:updated });
 });
+app.post('/api/profile/avatar', auth, async (req,res) => {
+ const dataUrl=req.body?.avatar;
+ if (dataUrl===null) {
+  if (postgres) await pgPool.query('DELETE FROM user_avatars WHERE user_id=$1',[req.user.id]);
+  else db.prepare('DELETE FROM user_avatars WHERE user_id=?').run(req.user.id);
+  return res.json({ok:true,avatar:null});
+ }
+ const match=typeof dataUrl==='string'&&dataUrl.length<=180000?dataUrl.match(/^data:image\/jpeg;base64,([A-Za-z0-9+/]+={0,2})$/):null;
+ if(!match)return res.status(400).json({error:'Elige una foto JPG válida de hasta 120 KB.'});
+ const bytes=Buffer.from(match[1],'base64');
+ if(bytes.length>120*1024||bytes.toString('base64')!==match[1]||bytes.length<4||bytes[0]!==0xff||bytes[1]!==0xd8||bytes[2]!==0xff)return res.status(400).json({error:'La foto debe ser un JPG válido y pesar hasta 120 KB.'});
+ try {
+  if(postgres) await pgPool.query('INSERT INTO user_avatars (user_id,data_url) VALUES ($1,$2) ON CONFLICT(user_id) DO UPDATE SET data_url=EXCLUDED.data_url,updated_at=NOW()',[req.user.id,dataUrl]);
+  else db.prepare('INSERT INTO user_avatars (user_id,data_url) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET data_url=excluded.data_url,updated_at=CURRENT_TIMESTAMP').run(req.user.id,dataUrl);
+  res.json({ok:true,avatar:dataUrl});
+ } catch(error) { console.error('No se pudo guardar la foto de perfil:',error.message);res.status(503).json({error:'No se pudo guardar la foto. Inténtalo de nuevo.'}); }
+});
 app.post('/api/logout', auth, async (req,res) => {
  if (postgres) await pgPool.query('DELETE FROM sessions WHERE token_hash=$1',[req.sessionDigest]);
  else db.prepare('DELETE FROM sessions WHERE token_hash=?').run(req.sessionDigest);
@@ -330,12 +356,12 @@ async function listClassesForUser(user) {
  const ids=classes.map(c=>Number(c.id));
  if (!ids.length) return [];
  const roster=postgres
-  ? (await pgPool.query('SELECT r.id,r.class_id,r.student_id,r.matricula,u.name AS student_name,u.details AS student_details FROM class_roster r LEFT JOIN users u ON u.id=r.student_id WHERE r.class_id=ANY($1::bigint[]) ORDER BY r.matricula',[ids])).rows
-  : db.prepare(`SELECT r.id,r.class_id,r.student_id,r.matricula,u.name AS student_name,u.details AS student_details FROM class_roster r LEFT JOIN users u ON u.id=r.student_id WHERE r.class_id IN (${ids.map(()=>'?').join(',')}) ORDER BY r.matricula`).all(...ids);
+  ? (await pgPool.query('SELECT r.id,r.class_id,r.student_id,r.matricula,u.name AS student_name,u.details AS student_details,av.data_url AS student_avatar FROM class_roster r LEFT JOIN users u ON u.id=r.student_id LEFT JOIN user_avatars av ON av.user_id=u.id WHERE r.class_id=ANY($1::bigint[]) ORDER BY r.matricula',[ids])).rows
+  : db.prepare(`SELECT r.id,r.class_id,r.student_id,r.matricula,u.name AS student_name,u.details AS student_details,av.data_url AS student_avatar FROM class_roster r LEFT JOIN users u ON u.id=r.student_id LEFT JOIN user_avatars av ON av.user_id=u.id WHERE r.class_id IN (${ids.map(()=>'?').join(',')}) ORDER BY r.matricula`).all(...ids);
  const byClass=new Map(ids.map(id=>[id,[]]));
  for (const row of roster) {
   const details=parseDetails(row.student_details),target=byClass.get(Number(row.class_id));
-  target.push({id:Number(row.id),studentId:row.student_id?Number(row.student_id):null,matricula:row.student_id?(String(details.studentId||'').trim()||null):row.matricula,name:row.student_name||null,learningPreferences:details.learningStyle?.preferences||[],registered:Boolean(row.student_id)});
+  target.push({id:Number(row.id),studentId:row.student_id?Number(row.student_id):null,matricula:row.student_id?(String(details.studentId||'').trim()||null):row.matricula,name:row.student_name||null,avatar:row.student_avatar||null,learningPreferences:details.learningStyle?.preferences||[],registered:Boolean(row.student_id)});
  }
  return classes.map(c=>({id:Number(c.id),name:c.name,academicLevel:c.academic_level,subject:c.subject,classType:c.class_type,classCode:c.class_code,createdAt:c.created_at,students:byClass.get(Number(c.id))||[]}));
 }
@@ -344,8 +370,8 @@ async function addClassMatriculas(teacherId,classId,values) {
   ? (await pgPool.query('SELECT id FROM classes WHERE id=$1 AND teacher_id=$2',[classId,teacherId])).rows[0]
   : db.prepare('SELECT id FROM classes WHERE id=? AND teacher_id=?').get(classId,teacherId);
  if (!klass) return null;
- const matriculas=[...new Set(values.map(value=>String(value).trim().toUpperCase()).filter(value=>/^[A-Z0-9-]{3,40}$/.test(value)))];
- if (!matriculas.length) throw new Error('Escribe matrículas válidas (3 a 40 letras, números o guiones).');
+ const matriculas=[...new Set(values.map(value=>String(value).trim().toUpperCase()).filter(value=>/^[A-Z0-9._-]{3,40}$/.test(value)))];
+ if (!matriculas.length) throw new Error('Escribe matrículas válidas (3 a 40 letras, números, puntos, guiones o guiones bajos).');
  if (matriculas.length>100) throw new Error('Agrega como máximo 100 matrículas por operación.');
  for (const matricula of matriculas) {
   const student=await getStudentByMatricula(matricula);
@@ -392,17 +418,17 @@ async function listAssignments(user) {
   const result=[];
   for (const assignment of assignments) {
    const rows=postgres
-    ? (await pgPool.query(`SELECT u.id AS student_id,sp.matricula,u.name AS student_name,u.details AS student_details,s.id AS submission_id,s.body,s.submitted_at,s.grade,s.feedback,s.graded_at
-       FROM users u LEFT JOIN student_profiles sp ON sp.user_id=u.id
+    ? (await pgPool.query(`SELECT u.id AS student_id,sp.matricula,u.name AS student_name,u.details AS student_details,av.data_url AS student_avatar,s.id AS submission_id,s.body,s.submitted_at,s.grade,s.feedback,s.graded_at
+       FROM users u LEFT JOIN student_profiles sp ON sp.user_id=u.id LEFT JOIN user_avatars av ON av.user_id=u.id
        LEFT JOIN assignment_submissions s ON s.assignment_id=$1 AND s.student_id=u.id
        WHERE EXISTS (SELECT 1 FROM class_roster r WHERE r.class_id=$2 AND r.student_id=u.id) ORDER BY u.name`,[assignment.id,assignment.class_id])).rows
-    : db.prepare(`SELECT u.id AS student_id,sp.matricula,u.name AS student_name,u.details AS student_details,s.id AS submission_id,s.body,s.submitted_at,s.grade,s.feedback,s.graded_at
-       FROM users u LEFT JOIN student_profiles sp ON sp.user_id=u.id
+    : db.prepare(`SELECT u.id AS student_id,sp.matricula,u.name AS student_name,u.details AS student_details,av.data_url AS student_avatar,s.id AS submission_id,s.body,s.submitted_at,s.grade,s.feedback,s.graded_at
+       FROM users u LEFT JOIN student_profiles sp ON sp.user_id=u.id LEFT JOIN user_avatars av ON av.user_id=u.id
        LEFT JOIN assignment_submissions s ON s.assignment_id=? AND s.student_id=u.id
        WHERE EXISTS (SELECT 1 FROM class_roster r WHERE r.class_id=? AND r.student_id=u.id) ORDER BY u.name`).all(assignment.id,assignment.class_id);
    const submissions=rows.map(row=>{
     const details=parseDetails(row.student_details),rawMatricula=String(details.studentId||row.matricula||'');
-    return {studentId:Number(row.student_id),name:row.student_name,matricula:rawMatricula.startsWith('CUENTA-')?'':rawMatricula,submitted:Boolean(row.submission_id),body:row.body||'',submittedAt:row.submitted_at||null,grade:row.grade==null?null:Number(row.grade),feedback:row.feedback||'',gradedAt:row.graded_at||null};
+    return {studentId:Number(row.student_id),name:row.student_name,avatar:row.student_avatar||null,matricula:rawMatricula.startsWith('CUENTA-')?'':rawMatricula,submitted:Boolean(row.submission_id),body:row.body||'',submittedAt:row.submitted_at||null,grade:row.grade==null?null:Number(row.grade),feedback:row.feedback||'',gradedAt:row.graded_at||null};
    });
    result.push({id:Number(assignment.id),classId:Number(assignment.class_id),className:assignment.class_name,subject:assignment.subject,academicLevel:assignment.academic_level,title:assignment.title,instructions:assignment.instructions,dueAt:assignment.due_at,createdAt:assignment.created_at,submittedCount:submissions.filter(item=>item.submitted).length,studentCount:submissions.length,submissions});
   }
@@ -558,57 +584,72 @@ app.post('/api/study-guide', auth, async (req,res) => {
 });
 app.post('/api/image', auth, async (req, res) => {
  if (!mediaFeatureEnabled()) return res.status(503).json({ error: 'La generación multimedia está desactivada. El administrador debe configurarla en Render.' });
- if (!process.env.OPENAI_API_KEY) return res.status(503).json({ error: 'El administrador aún debe configurar OPENAI_API_KEY en el hosting.' });
+ const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+ const apiToken = process.env.CLOUDFLARE_API_TOKEN;
+ if (!accountId || !apiToken) return res.status(503).json({ error: 'El administrador debe configurar CLOUDFLARE_ACCOUNT_ID y CLOUDFLARE_API_TOKEN en el hosting.' });
  const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : '';
- if (prompt.length < 4 || prompt.length > 3000) return res.status(400).json({ error: 'Describe la imagen con entre 4 y 3000 caracteres.' });
+ if (prompt.length < 4 || prompt.length > 2048) return res.status(400).json({ error: 'Describe la imagen con entre 4 y 2048 caracteres.' });
  if (!allowMediaRequest(req, res, 'image', 3)) return;
  try {
-  const response = await fetch('https://api.openai.com/v1/images/generations', {
+  const model = process.env.CLOUDFLARE_IMAGE_MODEL || '@cf/black-forest-labs/flux-1-schnell';
+  if (!/^@cf\/[a-z0-9._-]+\/[a-z0-9._-]+$/i.test(model)) return res.status(503).json({ error: 'El modelo de imágenes de Cloudflare no tiene un formato válido.' });
+  const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/run/${model}`, {
    method: 'POST',
-   headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-   body: JSON.stringify({
-    model: process.env.OPENAI_IMAGE_MODEL || 'gpt-image-2.5-flare',
-    prompt,
-    size: '1024x1024',
-    quality: 'medium',
-    output_format: 'png',
-    n: 1,
-    safety_identifier: crypto.createHash('sha256').update(String(req.user.id)).digest('hex')
-   }),
+   headers: { 'content-type': 'application/json', authorization: `Bearer ${apiToken}` },
+   body: JSON.stringify({ prompt, steps: 4 }),
    signal: AbortSignal.timeout(120000)
   });
-  const data = await response.json();
-  if (!response.ok) return res.status(response.status === 401 ? 502 : response.status === 429 ? 429 : 502).json({ error: openAIServiceError(response.status) });
-  const image = data.data?.[0]?.b64_json;
-  if (!image) return res.status(502).json({ error: 'OpenAI no devolvió una imagen. Inténtalo con otra descripción.' });
-  res.json({ image, mimeType: 'image/png' });
+  const data = await response.json().catch(() => null);
+  if (!response.ok || data?.success === false) {
+   if (response.status === 429) return res.status(429).json({ error: 'Cloudflare alcanzó su límite temporal de generación. Inténtalo más tarde.' });
+   if (response.status === 401 || response.status === 403) return res.status(503).json({ error: 'Cloudflare rechazó sus credenciales. Revisa el Account ID y el token de Workers AI en Render.' });
+   console.error('Cloudflare Images API error:', data?.errors?.[0]?.message || response.status);
+   return res.status(502).json({ error: 'Cloudflare no pudo crear la imagen. Revisa el modelo y el saldo o límite disponible.' });
+  }
+  const image = data?.result?.image;
+  if (typeof image !== 'string' || !image) return res.status(502).json({ error: 'Cloudflare no devolvió una imagen. Inténtalo con otra descripción.' });
+  res.json({ image, mimeType: 'image/jpeg' });
  } catch (error) {
   if (error?.name === 'TimeoutError') return res.status(504).json({ error: 'La imagen está tardando demasiado. Prueba de nuevo con una descripción más breve.' });
-  res.status(502).json({ error: 'No se pudo conectar con el servicio de imágenes de OpenAI.' });
+  res.status(502).json({ error: 'No se pudo conectar con el servicio de imágenes de Cloudflare.' });
  }
 });
 app.post('/api/audio', auth, async (req, res) => {
  if (!mediaFeatureEnabled()) return res.status(503).json({ error: 'La generación multimedia está desactivada. El administrador debe configurarla en Render.' });
- if (!process.env.OPENAI_API_KEY) return res.status(503).json({ error: 'El administrador aún debe configurar OPENAI_API_KEY en el hosting.' });
+ if (!process.env.GEMINI_API_KEY) return res.status(503).json({ error: 'El administrador aún debe configurar GEMINI_API_KEY en el hosting.' });
  const input = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
  if (!input || input.length > 4000) return res.status(400).json({ error: 'Escribe un texto de hasta 4000 caracteres para convertirlo en audio.' });
  if (!allowMediaRequest(req, res, 'audio', 6)) return;
  try {
-  const response = await fetch('https://api.openai.com/v1/audio/speech', {
+  const model = process.env.GEMINI_TTS_MODEL || 'gemini-3.8-flash-lite-tts';
+  const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
    method: 'POST',
-   headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-   body: JSON.stringify({ model: process.env.OPENAI_TTS_MODEL || 'gpt-4o-mini-tts', voice: 'marin', input, response_format: 'mp3' }),
+   headers: { 'content-type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+   body: JSON.stringify({
+    model,
+    input: [{ type: 'user_input', content: [{
+     type: 'text', text: input,
+     annotations: [{ type: 'speech_metadata', style: 'Voz clara, amable y natural en español latinoamericano, con ritmo pausado para facilitar el aprendizaje.' }]
+    }] }],
+    response_format: { type: 'audio' },
+    generation_config: { speech_config: [{ voice: process.env.GEMINI_TTS_VOICE || 'Kore' }] }
+   }),
    signal: AbortSignal.timeout(60000)
   });
+  const data = await response.json().catch(() => null);
   if (!response.ok) {
-   const status = response.status;
-   return res.status(status === 401 ? 502 : status === 429 ? 429 : 502).json({ error: openAIServiceError(status) });
+   if (response.status === 429) return res.status(429).json({ error: 'Gemini alcanzó su límite de solicitudes o saldo. Revisa la cuota de la API e inténtalo más tarde.' });
+   if (response.status === 401 || response.status === 403) return res.status(503).json({ error: 'Gemini rechazó la clave o el acceso al modelo. Revisa GEMINI_API_KEY y la configuración de Google AI.' });
+   console.error('Gemini TTS API error:', data?.error?.message || response.status);
+   return res.status(502).json({ error: 'Gemini no pudo generar el audio. Inténtalo de nuevo.' });
   }
-  const audio = Buffer.from(await response.arrayBuffer()).toString('base64');
-  res.json({ audio, mimeType: 'audio/mpeg' });
+  const audioBlock = data?.steps?.filter(step => step.type === 'model_output').flatMap(step => step.content || []).filter(item => item.type === 'audio').at(-1);
+  const audio = audioBlock?.data || data?.output_audio?.data;
+  if (typeof audio !== 'string' || !audio) return res.status(502).json({ error: 'Gemini no devolvió audio. Inténtalo otra vez.' });
+  res.json({ audio, mimeType: audioBlock?.mime_type || 'audio/wav' });
  } catch (error) {
   if (error?.name === 'TimeoutError') return res.status(504).json({ error: 'El audio está tardando demasiado. Inténtalo otra vez.' });
-  res.status(502).json({ error: 'No se pudo conectar con el servicio de audio de OpenAI.' });
+  res.status(502).json({ error: 'No se pudo conectar con el servicio de audio de Gemini.' });
  }
 });
 initializeDatabase().then(() => {
